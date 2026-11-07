@@ -12,234 +12,7 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 10000;
-
-// ==========================================
-// ESTADO DAS SALAS
-// ==========================================
 const rooms = {};
-
-function createRoom(roomId, mode) {
-  return {
-    id: roomId,
-    mode: mode || 'pvp',
-    players: {},          // socketId -> playerState
-    bots: [],             // lista de bots
-    glooWalls: [],        // paredes de gelo
-    groundWeapons: [],    // armas no chão
-    powerups: [],         // power-ups
-    createdAt: Date.now()
-  };
-}
-
-// ==========================================
-// CRIA BOTS (padrão para todas as salas)
-// ==========================================
-function spawnBots(roomId) {
-  const bots = [];
-  const botCount = 3;
-  for (let i = 0; i < botCount; i++) {
-    bots.push({
-      id: `bot_${roomId}_${i}`,
-      type: 'bot',
-      health: 100,
-      alive: true,
-      x: Math.random() * 60 - 30,
-      z: Math.random() * 60 - 30,
-      yaw: Math.random() * Math.PI * 2,
-      name: `Bot ${i + 1}`
-    });
-  }
-  return bots;
-}
-
-// ==========================================
-// ESTADO DO JOGADOR
-// ==========================================
-function createPlayerState(socket, data) {
-  return {
-    id: socket.id,
-    name: data.username || 'Jogador',
-    skin: data.skin || 'Default',
-    health: 100,
-    alive: true,
-    x: 0, z: 0, yaw: 0,
-    currentWeapon: null,
-    kills: 0,
-    streak: 0
-  };
-}
-
-// ==========================================
-// CONEXÃO
-// ==========================================
-io.on('connection', (socket) => {
-  console.log('Conectado:', socket.id);
-
-  // -------- ENTRAR NA SALA --------
-  socket.on('joinRoom', (data) => {
-    const { roomId, username, skin, mode } = data;
-    socket.join(roomId);
-
-    if (!rooms[roomId]) {
-      rooms[roomId] = createRoom(roomId, mode);
-      rooms[roomId].bots = spawnBots(roomId);
-    }
-
-    const room = rooms[roomId];
-    const playerState = createPlayerState(socket, { username, skin });
-    room.players[socket.id] = playerState;
-
-    // Envia o estado COMPLETO da sala (tudo que o cliente precisa ver)
-    socket.emit('roomState', {
-      id: room.id,
-      mode: room.mode,
-      players: room.players,
-      bots: room.bots,
-      glooWalls: room.glooWalls,
-      groundWeapons: room.groundWeapons,
-      powerups: room.powerups
-    });
-
-    // Avisa todos que um novo jogador entrou
-    socket.to(roomId).emit('playerJoined', playerState);
-
-    console.log(`${username} entrou na sala ${roomId}. Jogadores: ${Object.keys(room.players).length}`);
-  });
-
-  // -------- MOVIMENTO --------
-  socket.on('move', (data) => {
-    const roomId = findRoomOfPlayer(socket.id);
-    if (!roomId) return;
-    const p = rooms[roomId].players[socket.id];
-    if (!p) return;
-
-    p.x = data.x;
-    p.z = data.z;
-    p.yaw = data.yaw;
-
-    socket.to(roomId).emit('playerMoved', {
-      id: socket.id,
-      data: { x: data.x, z: data.z, yaw: data.yaw }
-    });
-  });
-
-  // -------- TROCA DE ARMA --------
-  socket.on('switchWeapon', (weaponType) => {
-    const roomId = findRoomOfPlayer(socket.id);
-    if (!roomId) return;
-    const p = rooms[roomId].players[socket.id];
-    if (!p) return;
-
-    p.currentWeapon = weaponType;
-    socket.to(roomId).emit('playerSwitchedWeapon', {
-      id: socket.id,
-      weapon: weaponType
-    });
-  });
-
-  // -------- TIRO (AUTORITATIVO) --------
-  socket.on('shoot', (data) => {
-    const roomId = findRoomOfPlayer(socket.id);
-    if (!roomId) return;
-    const room = rooms[roomId];
-    const p = room.players[socket.id];
-    if (!p || !p.alive) return;
-
-    const damage = data.damage || 25;
-
-    // Acertou um bot
-    if (data.targetType === 'bot' && data.targetId) {
-      const bot = room.bots.find(b => b.id === data.targetId);
-      if (bot && bot.alive) {
-        bot.health -= damage;
-        if (bot.health <= 0) {
-          bot.alive = false;
-          bot.health = 0;
-          p.kills++;
-          p.streak++;
-          io.to(roomId).emit('botKilled', {
-            targetId: bot.id,
-            killerId: socket.id,
-            newKills: p.kills,
-            streak: p.streak
-          });
-        } else {
-          io.to(roomId).emit('botHit', { id: bot.id, health: bot.health });
-        }
-      }
-    }
-
-    // Acertou outro jogador
-    if (data.targetType === 'player' && data.targetId) {
-      const target = room.players[data.targetId];
-      if (target && target.alive) {
-        target.health -= damage;
-        if (target.health <= 0) {
-          target.alive = false;
-          target.health = 0;
-          p.kills++;
-          p.streak++;
-          io.to(roomId).emit('playerDied', {
-            id: target.id,
-            killerId: socket.id,
-            killerName: p.name
-          });
-          io.to(roomId).emit('killsUpdate', { id: socket.id, kills: p.kills });
-        } else {
-          io.to(roomId).emit('playerHit', { id: target.id, health: target.health });
-        }
-      }
-    }
-  });
-
-  // -------- GELO (GLOO WALL) --------
-  socket.on('spawnGloo', (wallData) => {
-    const roomId = findRoomOfPlayer(socket.id);
-    if (!roomId) return;
-    const room = rooms[roomId];
-
-    room.glooWalls.push(wallData);
-    io.to(roomId).emit('glooCreated', wallData);
-  });
-
-  // -------- BOT ATACA JOGADOR --------
-  socket.on('botAttack', (data) => {
-    const roomId = findRoomOfPlayer(socket.id);
-    if (!roomId) return;
-    const room = rooms[roomId];
-    const target = room.players[data.playerId];
-    if (!target || !target.alive) return;
-
-    const damage = 10;
-    target.health -= damage;
-    if (target.health <= 0) {
-      target.alive = false;
-      target.health = 0;
-      io.to(roomId).emit('playerDied', {
-        id: target.id,
-        killerId: data.botId,
-        killerName: 'Bot'
-      });
-      io.to(roomId).emit('gameOver');
-    } else {
-      io.to(roomId).emit('playerHit', { id: target.id, health: target.health });
-    }
-  });
-
-  // -------- DESCONEXÃO --------
-  socket.on('disconnect', () => {
-    const roomId = findRoomOfPlayer(socket.id);
-    if (roomId && rooms[roomId]) {
-      delete rooms[roomId].players[socket.id];
-      socket.to(roomId).emit('playerLeft', socket.id);
-      if (Object.keys(rooms[roomId].players).length === 0) {
-        delete rooms[roomId];
-        console.log(`Sala ${roomId} deletada (vazia)`);
-      }
-    }
-    console.log('Desconectado:', socket.id);
-  });
-});
 
 function findRoomOfPlayer(socketId) {
   for (const roomId in rooms) {
@@ -247,6 +20,169 @@ function findRoomOfPlayer(socketId) {
   }
   return null;
 }
+
+// Função que encerra a partida
+function endMatch(roomId, winnerName = null) {
+  const room = rooms[roomId];
+  if (!room || room.ended) return;
+  
+  room.ended = true;
+  clearTimeout(room.timeout);
+  clearTimeout(room.matchTimer);
+
+  let winnerId = null;
+  if (winnerName) {
+    for (const id in room.players) {
+      if (room.players[id].name === winnerName) { winnerId = id; break; }
+    }
+  } else {
+    // Se não tem vencedor (tempo esgotado), pega quem tem mais kills
+    let maxKills = -1;
+    for (const id in room.players) {
+      if (room.players[id].kills > maxKills) {
+        maxKills = room.players[id].kills;
+        winnerId = id;
+      }
+    }
+  }
+
+  io.to(roomId).emit('gameOver', {
+    winnerId: winnerId,
+    winnerName: winnerName || (winnerId ? room.players[winnerId].name : 'Empate')
+  });
+
+  // Limpa a sala após enviar a mensagem
+  setTimeout(() => { delete rooms[roomId]; }, 2000);
+}
+
+io.on('connection', (socket) => {
+  socket.on('joinRoom', (data) => {
+    const { roomId, username, skin, mode } = data;
+    socket.join(roomId);
+
+    if (!rooms[roomId]) {
+      // Cria a sala nova
+      rooms[roomId] = {
+        id: roomId,
+        players: {},
+        glooWalls: [],
+        ended: false
+      };
+
+      // Timer de 30s para o amigo entrar
+      rooms[roomId].timeout = setTimeout(() => {
+        if (Object.keys(rooms[roomId].players).length < 2) {
+          io.to(roomId).emit('roomCancelled', { reason: 'O amigo não entrou a tempo.' });
+          delete rooms[roomId];
+        }
+      }, 30000); // 30 segundos
+    }
+
+    const room = rooms[roomId];
+    if (room.ended) return; // Se a partida já acabou, ignora
+
+    // Adiciona o jogador
+    room.players[socket.id] = {
+      id: socket.id,
+      name: username || 'Jogador',
+      skin: skin || 'Default',
+      health: 100,
+      alive: true,
+      x: 0, z: 0, yaw: 0,
+      kills: 0
+    };
+
+    // Se já tem 2 jogadores, inicia o cronômetro de 2 minutos
+    if (Object.keys(room.players).length === 2) {
+      clearTimeout(room.timeout);
+      
+      // Avisa que a partida começou e envia o estado
+      io.to(roomId).emit('matchStarted');
+      
+      // Define o fim da partida em 2 minutos
+      room.matchTimer = setTimeout(() => {
+        endMatch(roomId, null); // null = tempo esgotado
+      }, 120000); // 120.000 ms = 2 minutos
+    }
+
+    // Manda o estado atual para o jogador novo e avisa os outros
+    socket.emit('roomState', room);
+    socket.to(roomId).emit('playerJoined', room.players[socket.id]);
+  });
+
+  // Movimentação
+  socket.on('move', (data) => {
+    const roomId = findRoomOfPlayer(socket.id);
+    if (!roomId || rooms[roomId].ended) return;
+    
+    const p = rooms[roomId].players[socket.id];
+    if (!p) return;
+    p.x = data.x; p.z = data.z; p.yaw = data.yaw;
+
+    socket.to(roomId).emit('playerMoved', { id: socket.id, data });
+  });
+
+  // Tiro
+  socket.on('shoot', (data) => {
+    const roomId = findRoomOfPlayer(socket.id);
+    if (!roomId || rooms[roomId].ended) return;
+    
+    const room = rooms[roomId];
+    const shooter = room.players[socket.id];
+    if (!shooter || !shooter.alive) return;
+
+    const target = room.players[data.targetId];
+    if (target && target.alive) {
+      target.health -= data.damage;
+      
+      if (target.health <= 0) {
+        target.alive = false;
+        target.health = 0;
+        shooter.kills++;
+        
+        io.to(roomId).emit('playerDied', { id: target.id, killerId: socket.id, killerName: shooter.name });
+        io.to(roomId).emit('killsUpdate', { id: socket.id, kills: shooter.kills });
+
+        // Verifica se a partida deve acabar (só sobrou 1 vivo)
+        let aliveCount = 0;
+        let lastAlive = null;
+        for (const id in room.players) {
+          if (room.players[id].alive) { aliveCount++; lastAlive = room.players[id].name; }
+        }
+        
+        if (aliveCount <= 1) {
+          endMatch(roomId, lastAlive); // O último vivo ganha
+        }
+      } else {
+        io.to(roomId).emit('playerHit', { id: target.id, health: target.health });
+      }
+    }
+  });
+
+  // Gelo
+  socket.on('spawnGloo', (wallData) => {
+    const roomId = findRoomOfPlayer(socket.id);
+    if (!roomId || rooms[roomId].ended) return;
+    rooms[roomId].glooWalls.push(wallData);
+    io.to(roomId).emit('glooCreated', wallData);
+  });
+
+  // Desconexão
+  socket.on('disconnect', () => {
+    const roomId = findRoomOfPlayer(socket.id);
+    if (roomId && rooms[roomId]) {
+      delete rooms[roomId].players[socket.id];
+      
+      // Se sobrou só 1 jogador na sala após desconexão, ele ganha
+      const remaining = Object.keys(rooms[roomId].players);
+      if (remaining.length === 1) {
+        endMatch(roomId, rooms[roomId].players[remaining[0]].name);
+      } else if (remaining.length === 0) {
+        delete rooms[roomId];
+      }
+    }
+  });
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor rodando na porta ${PORT}`);
